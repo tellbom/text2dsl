@@ -10,7 +10,7 @@ import os
 app = FastAPI(title="APM Text2DSL API", version="1.0.0")
 
 # 配置
-ES_HOST = "http://localhost:9200"  # 修改为你的ES地址
+ES_HOST = "http://192.168.48.128:9200"  # 修改为你的ES地址
 
 # 初始化ES客户端 - 支持环境变量配置
 ES_URL = os.getenv("ES_HOST", ES_HOST)
@@ -197,40 +197,313 @@ def parse_time_range(time_str: str, timezone: str = "UTC") -> tuple:
 
 
 def generate_dsl_prompt(query: str, time_range: str, timezone: str = "UTC") -> str:
-    """生成LLM提示词"""
+    """生成完整的APM专用LLM提示词"""
     start_time, end_time = parse_time_range(time_range, timezone)
 
-    prompt = f"""
-你是一个专业的Elasticsearch DSL生成专家。根据用户的APM查询需求，生成对应的Elasticsearch DSL查询。
+    prompt = """
+你是一个专业的APM (Application Performance Monitoring) Elasticsearch DSL生成专家。
+根据用户的APM监控查询需求，生成高质量的Elasticsearch DSL查询。
+=== APM数据结构详解 ===
+索引模式:
 
-APM数据结构:
-- 事务数据索引: apm-*-transaction-*
-- 错误数据索引: apm-*-error-*  
-- 指标数据索引: apm-*-metric-*
+apm--transaction-  # 事务/请求数据（性能分析主要数据源）
+apm--error-        # 错误/异常数据
+apm--span-         # 分布式追踪span数据
+apm--metric-       # 系统/应用指标数据
 
-主要字段:
-- service.name: 服务名称
-- transaction.name: 接口/事务名称
-- transaction.duration.us: 响应时间(微秒)
-- @timestamp: 时间戳
-- http.response.status_code: HTTP状态码
-- error.exception.message: 错误信息
+核心字段映射:
+【事务字段】
 
-时间范围: {start_time.isoformat()} 到 {end_time.isoformat()}
+service.name: 服务名称 (keyword)
+service.version: 服务版本 (keyword)
+transaction.name: 事务/接口名称 (keyword)
+transaction.type: 事务类型 (request/page-load/task等)
+transaction.duration.us: 响应时间(微秒) (long)
+transaction.result: 事务结果 (success/failure/timeout等)
+transaction.sampled: 是否采样 (boolean)
+
+【时间和状态】
+
+@timestamp: 时间戳 (date)
+event.outcome: 事件结果 (success/failure/unknown)
+http.response.status_code: HTTP状态码 (long)
+http.request.method: HTTP方法 (keyword)
+url.path: 请求路径 (keyword)
+url.full: 完整URL (keyword)
+
+【错误字段】
+
+error.id: 错误ID (keyword)
+error.exception.type: 异常类型 (keyword)
+error.exception.message: 错误信息 (text)
+error.culprit: 错误位置 (keyword)
+error.grouping_key: 错误分组键 (keyword)
+
+【基础设施字段】
+
+host.name: 主机名 (keyword)
+host.ip: 主机IP (ip)
+container.id: 容器ID (keyword)
+kubernetes.pod.name: K8s Pod名称 (keyword)
+cloud.instance.id: 云实例ID (keyword)
+
+【业务字段】
+
+user.id: 用户ID (keyword)
+user.name: 用户名 (keyword)
+labels.*: 自定义标签 (keyword/text)
+tags.*: 标签 (keyword)
+
+【分布式追踪】
+
+trace.id: 链路ID (keyword)
+parent.id: 父span ID (keyword)
+span.id: span ID (keyword)
+
+=== 时间范围配置 ===
+查询时间范围: {start_time.isoformat()} 到 {end_time.isoformat()}
 时区: {timezone}
-
 用户查询: {query}
+=== DSL生成规则与最佳实践 ===
+【1. 时间过滤 - 必须包含】
+固定模板:
+{{
+"range": {{
+"@timestamp": {{
+"gte": "{start_time.isoformat()}",
+"lte": "{end_time.isoformat()}",
+"format": "strict_date_optional_time"
+}}
+}}
+}}
+【2. 聚合排序限制 - 重要】
+✅ 可用于排序的单值聚合:
 
-请生成标准的Elasticsearch DSL查询，要求:
-1. 包含正确的时间范围过滤
-2. 根据查询类型选择合适的索引
-3. 包含必要的聚合查询
-4. 只返回JSON格式的DSL，不要其他解释
+avg: 平均值
+max: 最大值
+min: 最小值
+sum: 总和
+cardinality: 唯一值计数
+value_count: 文档计数
+bucket_count: 桶计数
 
-DSL查询:
-"""
+❌ 禁止用于排序的多值聚合:
+
+percentiles: 百分位数
+stats: 统计信息
+extended_stats: 扩展统计
+histogram: 直方图
+date_histogram: 时间直方图
+
+正确排序示例: "order": {{"avg_duration": "desc"}}
+错误排序示例: "order": {{"p95_duration": "desc"}}
+【3. 性能优化配置】
+
+size: 0  # 不返回原始文档，只要聚合结果
+track_total_hits: false  # 不精确计算总数，提升性能
+"timeout": "30s"  # 设置查询超时
+
+【4. 常见APM查询模式】
+A. 服务性能排名:
+{{
+"aggs": {{
+"services": {{
+"terms": {{
+"field": "service.name",
+"size": 10,
+"order": {{"avg_duration": "desc"}}
+}},
+"aggs": {{
+"avg_duration": {{"avg": {{"field": "transaction.duration.us"}}}},
+"max_duration": {{"max": {{"field": "transaction.duration.us"}}}},
+"request_count": {{"value_count": {{"field": "@timestamp"}}}},
+"error_rate": {{
+"filter": {{"term": {{"event.outcome": "failure"}}}},
+"aggs": {{
+"error_count": {{"value_count": {{"field": "@timestamp"}}}}
+}}
+}}
+}}
+}}
+}}
+}}
+B. 接口性能分析:
+{{
+"aggs": {{
+"transactions": {{
+"terms": {{
+"field": "transaction.name",
+"size": 10,
+"order": {{"avg_duration": "desc"}}
+}},
+"aggs": {{
+"avg_duration": {{"avg": {{"field": "transaction.duration.us"}}}},
+"request_count": {{"value_count": {{"field": "@timestamp"}}}},
+"percentiles_duration": {{
+"percentiles": {{
+"field": "transaction.duration.us",
+"percents": [50, 90, 95, 99]
+}}
+}}
+}}
+}}
+}}
+}}
+C. 错误分析:
+{{
+"query": {{
+"bool": {{
+"filter": [
+{{"term": {{"event.outcome": "failure"}}}},
+时间过滤
+]
+}}
+}},
+"aggs": {{
+"error_types": {{
+"terms": {{
+"field": "error.exception.type",
+"size": 10,
+"order": {{"error_count": "desc"}}
+}},
+"aggs": {{
+"error_count": {{"value_count": {{"field": "@timestamp"}}}},
+"affected_services": {{
+"cardinality": {{"field": "service.name"}}
+}},
+"sample_message": {{
+"top_hits": {{
+"size": 1,
+"_source": ["error.exception.message", "service.name"]
+}}
+}}
+}}
+}}
+}}
+}}
+D. 时间趋势分析:
+{{
+"aggs": {{
+"timeline": {{
+"date_histogram": {{
+"field": "@timestamp",
+"fixed_interval": "1m",
+"extended_bounds": {{
+"min": "{start_time.isoformat()}",
+"max": "{end_time.isoformat()}"
+}}
+}},
+"aggs": {{
+"avg_duration": {{"avg": {{"field": "transaction.duration.us"}}}},
+"request_count": {{"value_count": {{"field": "@timestamp"}}}},
+"error_count": {{
+"filter": {{"term": {{"event.outcome": "failure"}}}}
+}}
+}}
+}}
+}}
+}}
+E. 状态码分布:
+{{
+"aggs": {{
+"status_codes": {{
+"terms": {{
+"field": "http.response.status_code",
+"size": 10,
+"order": {{"request_count": "desc"}}
+}},
+"aggs": {{
+"request_count": {{"value_count": {{"field": "@timestamp"}}}},
+"avg_duration": {{"avg": {{"field": "transaction.duration.us"}}}}
+}}
+}}
+}}
+}}
+【5. 复杂过滤条件】
+服务过滤:
+{{"term": {{"service.name": "服务名"}}}}
+多服务过滤:
+{{"terms": {{"service.name": ["service1", "service2"]}}}}
+响应时间范围:
+{{"range": {{"transaction.duration.us": {{"gte": 100000, "lte": 5000000}}}}}}
+状态码过滤:
+{{"range": {{"http.response.status_code": {{"gte": 400}}}}}}
+路径模糊匹配:
+{{"wildcard": {{"url.path": "api"}}}}
+正则表达式:
+{{"regexp": {{"transaction.name": ".login."}}}}
+存在性检查:
+{{"exists": {{"field": "user.id"}}}}
+【6. 高级聚合技巧】
+分桶后再聚合:
+{{
+"aggs": {{
+"duration_ranges": {{
+"range": {{
+"field": "transaction.duration.us",
+"ranges": [
+{{"to": 100000}},
+{{"from": 100000, "to": 500000}},
+{{"from": 500000, "to": 1000000}},
+{{"from": 1000000}}
+]
+}},
+"aggs": {{
+"request_count": {{"value_count": {{"field": "@timestamp"}}}}
+}}
+}}
+}}
+}}
+嵌套条件聚合:
+{{
+"aggs": {{
+"services": {{
+"terms": {{"field": "service.name"}},
+"aggs": {{
+"fast_requests": {{
+"filter": {{"range": {{"transaction.duration.us": {{"lt": 100000}}}}}},
+"aggs": {{
+"count": {{"value_count": {{"field": "@timestamp"}}}}
+}}
+}},
+"slow_requests": {{
+"filter": {{"range": {{"transaction.duration.us": {{"gte": 1000000}}}}}},
+"aggs": {{
+"count": {{"value_count": {{"field": "@timestamp"}}}}
+}}
+}}
+}}
+}}
+}}
+}}
+【7. 查询类型智能识别】
+根据用户查询内容智能选择索引和字段:
+性能相关关键词: "慢", "slow", "响应时间", "latency", "duration", "性能"
+→ 主要查询 transaction.duration.us 字段
+错误相关关键词: "错误", "error", "异常", "exception", "失败", "failure"
+→ 查询 apm--error- 索引，关注 event.outcome=failure
+流量相关关键词: "请求量", "QPS", "调用", "访问", "流量", "traffic"
+→ 重点统计文档计数和时间分布
+状态码相关关键词: "状态码", "4xx", "5xx", "500", "404"
+→ 聚合 http.response.status_code 字段
+服务相关关键词: "服务", "service", 具体服务名
+→ 按 service.name 分组
+接口相关关键词: "接口", "API", "endpoint", 具体路径
+→ 按 transaction.name 或 url.path 分组
+【8. 输出要求】
+
+只返回完整的JSON格式DSL查询语句
+必须包含时间范围过滤
+合理设置聚合大小 (size: 10-20)
+选择合适的排序方式
+根据查询类型优化字段选择
+确保所有语法正确，可直接执行
+不要包含任何解释文字或markdown格式
+
+请根据以上规则和用户查询，生成专业的APM Elasticsearch DSL查询：
+""".format(start=start_time.isoformat(), end=end_time.isoformat(), tz=timezone, query=query)
+
     return prompt
-
 
 def validate_dsl(dsl: Dict[Any, Any]) -> tuple[bool, str]:
     """验证DSL查询的基本结构"""
