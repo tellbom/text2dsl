@@ -200,7 +200,7 @@ def generate_dsl_prompt(query: str, time_range: str, timezone: str = "UTC") -> s
     """生成完整的APM专用LLM提示词"""
     start_time, end_time = parse_time_range(time_range, timezone)
 
-    prompt = """
+    prompt = f"""
 你是一个专业的APM (Application Performance Monitoring) Elasticsearch DSL生成专家。
 根据用户的APM监控查询需求，生成高质量的Elasticsearch DSL查询。
 === APM数据结构详解 ===
@@ -261,17 +261,17 @@ parent.id: 父span ID (keyword)
 span.id: span ID (keyword)
 
 === 时间范围配置 ===
-查询时间范围: {start_time.isoformat()} 到 {end_time.isoformat()}
-时区: {timezone}
-用户查询: {query}
+查询时间范围: {{start_time.isoformat()}} 到 {{end_time.isoformat()}}
+时区: {{timezone}}
+用户查询: {{query}}
 === DSL生成规则与最佳实践 ===
 【1. 时间过滤 - 必须包含】
 固定模板:
 {{
 "range": {{
 "@timestamp": {{
-"gte": "{start_time.isoformat()}",
-"lte": "{end_time.isoformat()}",
+"gte": "{{start_time.isoformat()}}",
+"lte": "{{end_time.isoformat()}}",
 "format": "strict_date_optional_time"
 }}
 }}
@@ -301,7 +301,7 @@ date_histogram: 时间直方图
 
 size: 0  # 不返回原始文档，只要聚合结果
 track_total_hits: false  # 不精确计算总数，提升性能
-"timeout": "30s"  # 设置查询超时
+注意：不要在DSL中包含timeout、index等参数，系统会自动处理
 
 【4. 常见APM查询模式】
 A. 服务性能排名:
@@ -389,8 +389,8 @@ D. 时间趋势分析:
 "field": "@timestamp",
 "fixed_interval": "1m",
 "extended_bounds": {{
-"min": "{start_time.isoformat()}",
-"max": "{end_time.isoformat()}"
+"min": "{{start_time.isoformat()}}",
+"max": "{{end_time.isoformat()}}"
 }}
 }},
 "aggs": {{
@@ -500,9 +500,44 @@ E. 状态码分布:
 确保所有语法正确，可直接执行
 不要包含任何解释文字或markdown格式
 
-请根据以上规则和用户查询，生成专业的APM Elasticsearch DSL查询：
-""".format(start=start_time.isoformat(), end=end_time.isoformat(), tz=timezone, query=query)
+【重要：聚合命名和排序规则】
 
+1. 聚合名称必须唯一且明确：
+   ✅ 正确示例：
+   "aggs": {{
+     "services": {{
+       "terms": {{
+         "field": "service.name",
+         "order": {{"avg_response": "desc"}}  // 排序字段名
+       }},
+       "aggs": {{
+         "avg_response": {{  // 聚合名称必须与排序字段名一致
+           "avg": {{"field": "transaction.duration.us"}}
+         }}
+       }}
+     }}
+   }}
+
+   ❌ 错误示例：
+   "order": {{"avg_duration": "desc"}}  // 排序字段名
+   "aggs": {{
+     "avg_response": {{  // 聚合名称不一致
+       "avg": {{"field": "transaction.duration.us"}}
+     }}
+   }}
+
+2. 嵌套聚合排序规则：
+   - 每层聚合只能使用本层定义的子聚合进行排序
+   - 不能跨层引用聚合名称
+   - 嵌套层级中，聚合名称要有层级标识
+
+3. 标准命名模式：
+   - 服务级聚合：service_xxx (如 service_avg_duration)
+   - 接口级聚合：endpoint_xxx (如 endpoint_avg_duration)  
+   - 时间级聚合：time_xxx (如 time_avg_duration)
+
+请根据以上规则和用户查询，生成专业的APM Elasticsearch DSL查询：
+"""
     return prompt
 
 def validate_dsl(dsl: Dict[Any, Any]) -> tuple[bool, str]:
